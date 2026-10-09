@@ -854,12 +854,50 @@ interface PdfExtractResult {
    *  could be read — check `warnings`, not just truthiness, before deciding
    *  that means the document has no text. */
   text: string;
-  /** Number of leaf /Type/Page objects found via the Pages tree. */
+  /** Number of leaf /Type/Page objects found via the Pages tree (the WHOLE
+   *  document's page count, even when `pageRange` restricted extraction to
+   *  a subset — see `extractedPages` for how many were actually read). */
   pages: number;
+  /** Number of pages actually extracted into `text`. Equal to `pages`
+   *  unless a `pageRange` option restricted the run. */
+  extractedPages: number;
   /** Non-fatal problems found while extracting (unknown font, missing
    *  ToUnicode, etc). A non-empty array does not mean the text is wrong, but
    *  it means something was guessed rather than read. */
   warnings: string[];
+}
+
+interface PdfExtractOptions {
+  /** Restrict extraction to a slice of the document's leaf pages, bounded by
+   *  PAGE OBJECT NUMBERS rather than page indexes — built for sources (e.g.
+   *  New Mexico's NMOneSource chapter PDFs, fleet #2884) whose per-section
+   *  bookmarks in `extractPdfOutline`'s output give a /Dest page object
+   *  directly, with no indexing step of their own needed. `fromPageObj` is
+   *  resolved to its position in document order and extraction starts
+   *  there; `toPageObj` (also resolved to its position) is the LAST page
+   *  included — pass the object a FOLLOWING bookmark points to and extract
+   *  up to (not including) it by resolving that page's own PRECEDING page
+   *  instead, since this is page-granularity, not byte-granularity. If
+   *  `fromPageObj` is not found among the document's pages, this option is
+   *  ignored and the whole document is extracted (a safe fallback, not a
+   *  silent wrong answer — a warning is added). */
+  pageRange?: { fromPageObj: number; toPageObj?: number };
+}
+
+interface PdfOutlineEntry {
+  /** The bookmark's own text, verbatim (e.g. "30-2-1. Murder." or
+   *  "ARTICLE 1  General Provisions" or "ANNOTATIONS"). */
+  title: string;
+  /** The PDF page OBJECT NUMBER this bookmark's /Dest (or /A GoTo action)
+   *  points to, or null if neither was found on this node. Pass this
+   *  straight into `extractPdfText`'s `pageRange` option — no index lookup
+   *  needed on the caller's side. */
+  pageObjNum: number | null;
+  /** Nesting depth in the outline tree, root's children = 0. A section's
+   *  own "ANNOTATIONS" child (depth = section's depth + 1) is how a caller
+   *  distinguishes statutory text from case annotations that start on the
+   *  same page — see mcps/new-mexico-code for the worked example. */
+  depth: number;
 }
 
 type FontDecoder =
@@ -935,7 +973,7 @@ interface RawObject {
 }
 
 /** Extract readable text from a simple, non-encrypted, non-scanned PDF. */
-async function extractPdfText(buf: ArrayBuffer): Promise<PdfExtractResult> {
+async function extractPdfText(buf: ArrayBuffer, options?: PdfExtractOptions): Promise<PdfExtractResult> {
   const bytes = new Uint8Array(buf);
   // windows-1252 decode is total (every byte maps to exactly one UTF-16 code
   // unit) and length-preserving, so a match index found in `scan` is also a
@@ -951,10 +989,29 @@ async function extractPdfText(buf: ArrayBuffer): Promise<PdfExtractResult> {
   // inside", which is how Catalog/Pages/ObjStm discovery works regardless of
   // what else that object's dictionary contains — see the file header.
   const objStarts: { index: number; num: number }[] = [];
+  // Object number -> index right after its "N 0 obj" marker (i.e. where the
+  // dictionary text begins), for every object found by the SAME forward
+  // scan that builds objStarts — first occurrence wins, matching what a
+  // one-shot `.exec` would find. This turns getDirectObject's lookup from
+  // one full-document regex scan PER DISTINCT OBJECT NUMBER into one O(1)
+  // map read: with a large page-tree walk (New Mexico's chapter PDFs run
+  // 657-1,138+ pages, fleet #2884) the old per-call scan made even a
+  // `pageRange`-restricted extraction cost nearly as much as extracting the
+  // whole document, because walking the Pages tree alone touches every
+  // page's object once regardless of how many are actually rendered —
+  // measured 1,611ms for a 56-of-1,138-page extraction before this fix vs.
+  // 1,699ms for the full document. The fallback regex scan below is kept
+  // for any object this forward pass didn't catch (none observed, but
+  // cheaper to keep than to prove impossible).
+  const objEndByNum = new Map<number, number>();
   {
     const re = /(\d+)\s+0\s+obj\b/g;
     let m: RegExpExecArray | null;
-    while ((m = re.exec(scan))) objStarts.push({ index: m.index, num: parseInt(m[1], 10) });
+    while ((m = re.exec(scan))) {
+      objStarts.push({ index: m.index, num: parseInt(m[1], 10) });
+      const num = parseInt(m[1], 10);
+      if (!objEndByNum.has(num)) objEndByNum.set(num, m.index + m[0].length);
+    }
   }
   function objNumBefore(markerIndex: number): number | null {
     let lo = 0, hi = objStarts.length - 1, ans: number | null = null;
@@ -968,10 +1025,16 @@ async function extractPdfText(buf: ArrayBuffer): Promise<PdfExtractResult> {
 
   function getDirectObject(n: number): RawObject | null {
     if (objCache.has(n)) return objCache.get(n) ?? null;
-    const re = new RegExp(`(?:^|\\D)${n}\\s+0\\s+obj`);
-    const m = re.exec(scan);
-    if (!m) { objCache.set(n, null); return null; }
-    const objStart = m.index + m[0].length;
+    const fastEnd = objEndByNum.get(n);
+    let objStart: number;
+    if (fastEnd !== undefined) {
+      objStart = fastEnd;
+    } else {
+      const re = new RegExp(`(?:^|\\D)${n}\\s+0\\s+obj`);
+      const m = re.exec(scan);
+      if (!m) { objCache.set(n, null); return null; }
+      objStart = m.index + m[0].length;
+    }
     const endobjIdx = scan.indexOf('endobj', objStart);
     const streamIdx = scan.indexOf('stream', objStart);
     let dict: string;
@@ -1145,6 +1208,38 @@ async function extractPdfText(buf: ArrayBuffer): Promise<PdfExtractResult> {
   if (pagesRef !== null) walkPages(pagesRef, 0);
   else warnings.push('no /Type/Catalog or /Type/Pages object found');
 
+  const totalPages = leafPages.length;
+  let pagesToExtract = leafPages;
+  if (options?.pageRange) {
+    const { fromPageObj, toPageObj } = options.pageRange;
+    const fromIdx = leafPages.indexOf(fromPageObj);
+    if (fromIdx === -1) {
+      warnings.push(
+        `pageRange.fromPageObj ${fromPageObj} is not a leaf page in this document — extracting the whole document instead of the requested range.`,
+      );
+    } else {
+      let toIdx = leafPages.length - 1;
+      if (toPageObj !== undefined) {
+        const foundToIdx = leafPages.indexOf(toPageObj);
+        // toPageObj not found, or found strictly BEFORE fromIdx (a bad or
+        // out-of-order bookmark), falls back to end-of-document rather than
+        // producing a negative-length slice. Equal to fromIdx is normal and
+        // valid — a section whose first bookmarked child (e.g. its own
+        // "ANNOTATIONS") starts on the SAME page is a single-page range,
+        // not an error.
+        if (foundToIdx >= fromIdx) toIdx = foundToIdx;
+        else if (foundToIdx !== -1) {
+          warnings.push(
+            `pageRange.toPageObj ${toPageObj} resolves to a page before fromPageObj ${fromPageObj} — extracting through end of document instead.`,
+          );
+        } else {
+          warnings.push(`pageRange.toPageObj ${toPageObj} is not a leaf page in this document — extracting through end of document instead.`);
+        }
+      }
+      pagesToExtract = leafPages.slice(fromIdx, toIdx + 1);
+    }
+  }
+
   /** Parse a /ToUnicode CMap stream's `beginbfchar`/`beginbfrange` blocks into
    *  a code -> Unicode-codepoint map. Shared between Type0's 2-byte CIDs and
    *  a simple font's 1-byte codes — the CMap text format is identical either
@@ -1227,7 +1322,7 @@ async function extractPdfText(buf: ArrayBuffer): Promise<PdfExtractResult> {
   }
 
   const pageTexts: string[] = [];
-  for (const pn of leafPages) {
+  for (const pn of pagesToExtract) {
     const page = getObject(pn);
     if (!page) continue;
 
@@ -1291,7 +1386,122 @@ async function extractPdfText(buf: ArrayBuffer): Promise<PdfExtractResult> {
     pageTexts.push(out.trim());
   }
 
-  return { text: pageTexts.join('\n\n'), pages: leafPages.length, warnings };
+  return { text: pageTexts.join('\n\n'), pages: totalPages, extractedPages: pagesToExtract.length, warnings };
+}
+
+/**
+ * Parse a PDF's outline (bookmark) tree into a flat, document-order list of
+ * {title, pageObjNum, depth} entries — WITHOUT decompressing any content
+ * stream, so this is orders of magnitude cheaper than `extractPdfText` and
+ * safe to run just to decide WHERE to extract from. Built for
+ * mcps/new-mexico-code (fleet #2884): NMOneSource publishes each NMSA 1978
+ * CHAPTER as one PDF (657-1,138+ pages observed) but bookmarks every
+ * ARTICLE heading (depth 0), every SECTION citation (depth 1, e.g.
+ * "30-2-1. Murder."), and that section's own "ANNOTATIONS" sub-heading
+ * (depth 2) — giving a caller everything needed to resolve a bare citation
+ * straight to a page RANGE via `extractPdfText`'s `pageRange` option,
+ * without ever extracting pages the caller didn't ask for.
+ *
+ * Assumes outline objects are DIRECT (never compressed into an /ObjStm) —
+ * true of every source sampled while building this. A PDF whose outline IS
+ * compressed, or that has no /Outlines at all, returns an empty array
+ * rather than guessing; check for that before concluding a citation isn't
+ * bookmarked.
+ */
+function extractPdfOutline(buf: ArrayBuffer): PdfOutlineEntry[] {
+  const bytes = new Uint8Array(buf);
+  const scan = new TextDecoder('windows-1252').decode(bytes);
+
+  const objStarts: { index: number; num: number }[] = [];
+  // See extractPdfText's identical map for why: one O(1) lookup per object
+  // instead of one full-document regex scan — an outline tree with ~1,400
+  // bookmarks (New Mexico's larger chapters) made this function itself the
+  // bottleneck before this fix (measured 2.8s on Chapter 30's 5.8MB PDF).
+  const objEndByNum = new Map<number, number>();
+  {
+    const re = /(\d+)\s+0\s+obj\b/g;
+    let m: RegExpExecArray | null;
+    while ((m = re.exec(scan))) {
+      objStarts.push({ index: m.index, num: parseInt(m[1], 10) });
+      const num = parseInt(m[1], 10);
+      if (!objEndByNum.has(num)) objEndByNum.set(num, m.index + m[0].length);
+    }
+  }
+  function objNumBefore(markerIndex: number): number | null {
+    let lo = 0, hi = objStarts.length - 1, ans: number | null = null;
+    while (lo <= hi) {
+      const mid = (lo + hi) >> 1;
+      if (objStarts[mid].index <= markerIndex) { ans = objStarts[mid].num; lo = mid + 1; }
+      else hi = mid - 1;
+    }
+    return ans;
+  }
+
+  const dictCache = new Map<number, string | null>();
+  function dictOf(n: number): string | null {
+    if (dictCache.has(n)) return dictCache.get(n) ?? null;
+    let start: number;
+    const fastEnd = objEndByNum.get(n);
+    if (fastEnd !== undefined) {
+      start = fastEnd;
+    } else {
+      const re = new RegExp(`(?:^|\\D)${n}\\s+0\\s+obj`);
+      const m = re.exec(scan);
+      if (!m) { dictCache.set(n, null); return null; }
+      start = m.index + m[0].length;
+    }
+    const end = scan.indexOf('endobj', start);
+    const dict = end === -1 ? scan.slice(start, Math.min(scan.length, start + 4000)) : scan.slice(start, end);
+    dictCache.set(n, dict);
+    return dict;
+  }
+
+  // Prefer the Catalog's own /Outlines reference; fall back to the first
+  // direct /Type/Outlines object found anywhere (same "search for the type
+  // marker as plain text" approach extractPdfText uses for Catalog/Pages).
+  let outlinesRoot: number | null = null;
+  const catIdx = scan.search(/\/Type\s*\/Catalog\b/);
+  if (catIdx !== -1) {
+    const catNum = objNumBefore(catIdx);
+    const catDict = catNum !== null ? dictOf(catNum) : null;
+    const om = catDict ? /\/Outlines\s+(\d+)\s+0\s+R/.exec(catDict) : null;
+    if (om) outlinesRoot = parseInt(om[1], 10);
+  }
+  if (outlinesRoot === null) {
+    const outIdx = scan.search(/\/Type\s*\/Outlines\b/);
+    if (outIdx !== -1) outlinesRoot = objNumBefore(outIdx);
+  }
+  if (outlinesRoot === null) return [];
+
+  function pageObjOf(dict: string): number | null {
+    const destMatch = /\/Dest\s*\[\s*(\d+)\s+0\s+R/.exec(dict);
+    if (destMatch) return parseInt(destMatch[1], 10);
+    const actionMatch = /\/A\s*<<[^>]*\/D\s*\[\s*(\d+)\s+0\s+R/.exec(dict);
+    if (actionMatch) return parseInt(actionMatch[1], 10);
+    return null;
+  }
+
+  const entries: PdfOutlineEntry[] = [];
+  const seen = new Set<number>();
+  function walk(n: number, depth: number): void {
+    if (depth > 20 || seen.has(n)) return; // guards a malformed/cyclic tree
+    seen.add(n);
+    const dict = dictOf(n);
+    if (!dict) return;
+    const titleMatch = /\/Title\s*\(((?:\\.|[^()])*)\)/.exec(dict);
+    if (titleMatch) {
+      entries.push({ title: unescapePdfLiteral(titleMatch[1]).replace(/\s+/g, ' ').trim(), pageObjNum: pageObjOf(dict), depth });
+    }
+    const firstMatch = /\/First\s+(\d+)\s+0\s+R/.exec(dict);
+    if (firstMatch) walk(parseInt(firstMatch[1], 10), titleMatch ? depth + 1 : depth);
+    const nextMatch = /\/Next\s+(\d+)\s+0\s+R/.exec(dict);
+    if (nextMatch) walk(parseInt(nextMatch[1], 10), depth);
+  }
+  const rootDict = dictOf(outlinesRoot);
+  const rootFirst = rootDict ? /\/First\s+(\d+)\s+0\s+R/.exec(rootDict) : null;
+  if (rootFirst) walk(parseInt(rootFirst[1], 10), 0);
+
+  return entries;
 }
 /**
  * Texas Attorney General opinions — statute-citation search over recorded
