@@ -847,6 +847,38 @@ function collapse(s: string): string {
  * real either way). Verified against ND Century Code chapter 12.1-16
  * (Homicide, t12-1c16.pdf) — every content stream in that 9-page PDF uses
  * the indirect form.
+ *
+ * THREE FIXES PORTED FROM mcps/guam-code's PACK-LOCAL FORK (fleet #2904,
+ * folding in #2888's src/gu-pdf-extract.ts -- nothing about them was
+ * actually Guam-specific, which is why they live here now instead of only
+ * in that fork):
+ *   1. inflate()'s two stream writes were fire-and-forget
+ *      (void writer.write(...) / void writer.close()). A malformed deflate
+ *      stream (real, not hypothetical -- seen across several Guam chapter
+ *      PDFs) rejects that detached promise UNHANDLED, invisible to any
+ *      try/catch wrapped around this function's caller and fatal to the
+ *      whole Node process; in a Worker it is an unhandled rejection on a
+ *      live request. Both writes now carry a no-op .catch() -- the real
+ *      failure still surfaces through reader.read() below, which every
+ *      caller already handles.
+ *   2. A literal (parenthesized) string run was decoded by passing its raw
+ *      windows-1252-decoded bytes through unchanged, which is correct for a
+ *      WinAnsi font but wrong for a mapped1/cid font whose code space only
+ *      means anything via its own /ToUnicode CMap -- the same lookup a hex
+ *      string run already gets. Guam's PDF producer writes several of its
+ *      non-WinAnsi subset-embedded fonts' text as literal strings rather
+ *      than hex, which this extractor previously decoded as line-noise
+ *      control characters instead of the real text.
+ *   3. decompressedStream now retries a /FlateDecode stream with its tail
+ *      trimmed 1-4 bytes before giving up. Several real PDFs declare a
+ *      /Length a few bytes LONGER than the true deflate stream (confirmed
+ *      on Guam's 21gc033.pdf object 2: /Length says 96, the deflate stream
+ *      completes at byte 95, byte 96 is one stray trailing byte). Python's
+ *      zlib tolerates trailing garbage by default; the Workers/Node
+ *      DecompressionStream used here does not and throws "Trailing junk
+ *      found after the end of the compressed stream" -- the true stream
+ *      length is always <= the declared one in every sample seen, never
+ *      longer, so trimming is safe.
  */
 
 interface PdfExtractResult {
@@ -882,6 +914,18 @@ interface PdfExtractOptions {
    *  ignored and the whole document is extracted (a safe fallback, not a
    *  silent wrong answer — a warning is added). */
   pageRange?: { fromPageObj: number; toPageObj?: number };
+
+  /** Called right after a font's own /ToUnicode CMap is parsed (for either
+   *  a Type0 font's CID map or a simple font's 1-byte map), before it is
+   *  used to decode any text. Return a REPLACEMENT map to override specific
+   *  codes, or return nothing (undefined) to use the parsed map unchanged.
+   *  Built for mcps/guam-code (fleet #2888/#2904): one embedded symbol font
+   *  per chapter PDF carries a /ToUnicode CMap that is itself wrong in the
+   *  SOURCE file (confirmed by eye against the rendered PDF — not a general
+   *  parsing defect this shared extractor could detect), so the fix is
+   *  keyed by matching `fontDict` against something only that caller's PDFs
+   *  produce (there, a font name) rather than built into this file. */
+  fontCMapOverride?: (fontDict: string, map: Map<number, number>) => Map<number, number> | void;
 }
 
 interface PdfOutlineEntry {
@@ -915,8 +959,19 @@ type FontDecoder =
 async function inflate(bytes: Uint8Array): Promise<Uint8Array> {
   const ds = new DecompressionStream('deflate');
   const writer = ds.writable.getWriter();
-  void writer.write(bytes);
-  void writer.close();
+  // Fire-and-forget on purpose: the actual decompression result/error comes
+  // through reader.read() below, which every caller already wraps in a
+  // try/catch. Without a .catch() here, a malformed deflate stream rejects
+  // this DETACHED write/close promise UNHANDLED -- invisible to that
+  // try/catch and fatal to the whole process (ported from
+  // mcps/guam-code's gu-pdf-extract.ts FORK FIX 3/3, fleet #2888/#2904;
+  // confirmed crashing scripts/bake-sections.mjs outright on real Guam
+  // chapter PDFs). The no-op .catch() here does not hide a real failure --
+  // it still surfaces through reader.read() for the caller to see.
+  const writeDone = writer.write(bytes).catch(() => {});
+  const closeDone = writer.close().catch(() => {});
+  void writeDone;
+  void closeDone;
   const chunks: Uint8Array[] = [];
   const reader = ds.readable.getReader();
   for (;;) {
@@ -1157,12 +1212,28 @@ async function extractPdfText(buf: ArrayBuffer, options?: PdfExtractOptions): Pr
     const obj = getObject(n);
     if (!obj || !obj.streamBytes) return null;
     if (/\/FlateDecode/.test(obj.dict)) {
-      try {
-        return await inflate(obj.streamBytes);
-      } catch (e) {
-        warnings.push(`inflate failed for object ${n}: ${e instanceof Error ? e.message : String(e)}`);
-        return null;
+      // Ported from mcps/guam-code's gu-pdf-extract.ts FORK FIX (fleet
+      // #2888/#2904): several real PDFs store a /Length a small number of
+      // bytes LONGER than the TRUE deflate stream length (confirmed on
+      // Guam's 21gc033.pdf object 2: /Length says 96, the deflate stream is
+      // complete at byte 95, and the 96th byte is one stray trailing byte).
+      // Python's zlib tolerates trailing garbage by default; the
+      // Workers/Node DecompressionStream used here does not and throws
+      // "Trailing junk found after the end of the compressed stream".
+      // Rather than fail the whole page, retry with the slice trimmed one
+      // byte shorter a few times -- the true stream length is always <= the
+      // declared one in every sample seen, never longer.
+      for (let trim = 0; trim <= 4 && trim < obj.streamBytes.length; trim++) {
+        try {
+          return await inflate(trim === 0 ? obj.streamBytes : obj.streamBytes.subarray(0, obj.streamBytes.length - trim));
+        } catch (e) {
+          if (trim === 4) {
+            warnings.push(`inflate failed for object ${n} even after trimming trailing bytes: ${e instanceof Error ? e.message : String(e)}`);
+            return null;
+          }
+        }
       }
+      return null;
     }
     return obj.streamBytes;
   }
@@ -1272,7 +1343,7 @@ async function extractPdfText(buf: ArrayBuffer, options?: PdfExtractOptions): Pr
         return { kind: 'cid', map: new Map() };
       }
       const map = await parseToUnicodeCMap(parseInt(tuMatch[1], 10));
-      return { kind: 'cid', map };
+      return { kind: 'cid', map: options?.fontCMapOverride?.(obj.dict, map) ?? map };
     }
     // Simple font. Every KRS sample used /WinAnsiEncoding, which decodes
     // directly as windows-1252 bytes below — unchanged. North Dakota's
@@ -1288,7 +1359,8 @@ async function extractPdfText(buf: ArrayBuffer, options?: PdfExtractOptions): Pr
     if (!/\/Encoding\s*\/WinAnsiEncoding\b/.test(obj.dict)) {
       const tuMatch = /\/ToUnicode\s+(\d+)\s+0\s+R/.exec(obj.dict);
       if (tuMatch) {
-        const map = await parseToUnicodeCMap(parseInt(tuMatch[1], 10));
+        const parsedMap = await parseToUnicodeCMap(parseInt(tuMatch[1], 10));
+        const map = options?.fontCMapOverride?.(obj.dict, parsedMap) ?? parsedMap;
         if (map.size) return { kind: 'mapped1', map };
       }
       warnings.push(`font object ${fontObjNum} has a non-WinAnsi simple encoding and no usable /ToUnicode; decoded as WinAnsi anyway`);
@@ -1301,7 +1373,26 @@ async function extractPdfText(buf: ArrayBuffer, options?: PdfExtractOptions): Pr
   const TJ_PIECE_RE = /\(((?:\\.|[^()])*)\)|<([0-9A-Fa-f\s]*)>/g;
 
   function decodeRun(dec: FontDecoder, literal: string | undefined, hex: string | undefined): string {
-    if (literal !== undefined) return unescapePdfLiteral(literal);
+    if (literal !== undefined) {
+      const unescaped = unescapePdfLiteral(literal);
+      // Ported from mcps/guam-code's gu-pdf-extract.ts FORK FIX 1/2 (fleet
+      // #2888/#2904): a WinAnsi run's literal-string bytes ARE already the
+      // correct windows-1252 text (unchanged below) -- but a non-WinAnsi
+      // simple font ('mapped1') or a Type0 font ('cid') can ALSO show up as
+      // a literal string rather than hex. Guam's PDF producer writes
+      // several of its subset-embedded fonts' text this way; passing the
+      // raw byte through unchanged (the old behavior here) skips that
+      // font's /ToUnicode map entirely and produces line-noise control
+      // characters instead of the real character -- route it through the
+      // SAME decoder a hex run below already uses.
+      if (dec.kind === 'winansi') return unescaped;
+      let out = '';
+      for (let i = 0; i < unescaped.length; i++) {
+        const code = unescaped.charCodeAt(i) & 0xff;
+        out += String.fromCodePoint(dec.map.get(code) ?? 0xfffd);
+      }
+      return out;
+    }
     const cleaned = (hex ?? '').replace(/\s+/g, '');
     let out = '';
     if (dec.kind === 'mapped1') {
