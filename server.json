@@ -3,7 +3,7 @@
   "name": "io.github.pipeworx-io/texas-ag-opinions",
   "title": "Texas Ag Opinions",
   "description": "Texas Attorney General opinions — statute-citation search over recorded subsequent treatment…",
-  "version": "0.1.3",
+  "version": "0.1.4",
   "websiteUrl": "https://pipeworx.io/packs/texas-ag-opinions",
   "repository": {
     "url": "https://github.com/pipeworx-io/mcp-texas-ag-opinions",
