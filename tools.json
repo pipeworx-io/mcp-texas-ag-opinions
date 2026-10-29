@@ -1,0 +1,50 @@
+[
+  {
+    "name": "tx_ag_opinion_lookup",
+    "description": "Look up a Texas Attorney General opinion by its number (e.g. \"KP-0537\", \"GA-0153\") -- returns the AG, date, requestor, RQ- request number, topic categories, one-sentence summary, full opinion text, statute citations found in it (best-effort), and whether it has a recorded overruled/modified/affirmed/withdrawn status. Sourced live from texasattorneygeneral.gov/opinions.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "opinion_number": {
+          "type": "string",
+          "description": "Opinion number, e.g. \"KP-0537\", \"GA-0153\", \"DM-212\". Case- and spacing-insensitive."
+        }
+      },
+      "required": [
+        "opinion_number"
+      ]
+    }
+  },
+  {
+    "name": "tx_ag_opinion_status",
+    "description": "Check whether a specific Texas AG opinion has a recorded overruled, modified, affirmed, superseded, or withdrawn status in the AG's own courtesy index. A 'not_listed' result does NOT mean the opinion is still good law -- the AG's index itself says it may be incomplete. Sourced from texasattorneygeneral.gov/opinions/opinions-overruled-modified-affirmed-withdrawn.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "opinion_number": {
+          "type": "string",
+          "description": "Opinion number, e.g. \"KP-0326\", \"GA-0999\"."
+        }
+      },
+      "required": [
+        "opinion_number"
+      ]
+    }
+  },
+  {
+    "name": "tx_ag_statute_search",
+    "description": "Find Texas AG opinions interpreting a given statute (e.g. \"552.101\" (Public Information Act), \"551\" (Open Meetings Act)) or citing it as a keyword. For Chapter 552/551 citations this returns real opinions (number, date, one-line summary) live from the AG's own topic-category index; other chapters fall back to opinions the AG's RECORDED overruled/modified/affirmed/withdrawn index cites this statute in. PARTIAL CAPABILITY: this is not a full-text search of the whole ~19,000-opinion archive, which needs an authentication this pack does not have -- see the response's coverage_note for exactly what was searched. For a specific opinion's full text, use tx_ag_opinion_lookup.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "citation": {
+          "type": "string",
+          "description": "A statute citation or keyword to search for, e.g. \"552.101\" or \"Tex. Gov't Code 2054.5191\" or \"Open Meetings\"."
+        }
+      },
+      "required": [
+        "citation"
+      ]
+    }
+  }
+]
