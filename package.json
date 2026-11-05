@@ -1,6 +1,6 @@
 {
   "name": "@pipeworx/mcp-texas-ag-opinions",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "Texas Attorney General opinions — statute-citation search over recorded subsequent treatment, opinion lookup by number, and the AG's own overruled/modified/affirmed/withdrawn status index. Fleet #2784.",
   "type": "module",
   "main": "lib/index.js",
@@ -27,7 +27,7 @@
     "mode": "gateway",
     "slug": "texas-ag-opinions",
     "gatewaySlug": "texas-ag-opinions",
-    "sourceHash": "v1-5c9c913651e28e45b7472472a42ec1cf6d1ef252434fa145819787cda3d6975f",
-    "sourceCommit": "f47d581679e1e887373df51ba623f891fbe4c464"
+    "sourceHash": "v1-51fa8632986cfab5039742e4430d63713ba24c7cc27e4fb8f8cce4218c157fd8",
+    "sourceCommit": "868e119d526d5409447b7ee2149afba7eb9d2593"
   }
 }
